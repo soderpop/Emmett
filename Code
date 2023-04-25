@@ -1,0 +1,272 @@
+import torch
+import skfuzzy as fuzz
+#from skfuzzy import FuzzySet
+from networkx import Graph
+import scipy.cluster.hierarchy as sch
+import numpy as np
+
+class FuzzyNetwork(torch.nn.Module):
+    def __init__(self, input_size, output_size, num_rules, som_size):
+        super(FuzzyNetwork, self).__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.num_rules = num_rules
+        self.input_variables = []
+        self.output_variables = []
+        self.rules = []
+        self.som_size = som_size
+        self.som = np.random.rand(som_size[0], som_size[1], input_size)
+        
+        for i in range(input_size):
+            self.input_variables.append(fuzz.antecedent.Universe(range(0, 256), 'input'+str(i)))
+        for i in range(output_size):
+            self.output_variables.append(fuzz.consequent.Universe(range(0, 256), 'output'+str(i)))
+        for i in range(num_rules):
+            rule = []
+            for j in range(input_size):
+                rule.append(fuzz.Antecedent(self.input_variables[j].universe, 'input'+str(j)+str(i)))
+            for j in range(output_size):
+                rule.append(fuzz.Consequent(self.output_variables[j].universe, 'output'+str(j)+str(i)))
+            self.rules.append(rule)
+            
+        # Cluster the rules using hierarchical clustering
+        self.rules_matrix = []
+        for i in range(num_rules):
+            rule = []
+            for j in range(input_size):
+                rule.append(self.rules[i][j])
+            for j in range(output_size):
+                rule.append(self.rules[i][j+input_size])
+            self.rules_matrix.append(rule)
+        self.rules_matrix = torch.tensor(self.rules_matrix).float()
+        linkage = sch.linkage(self.rules_matrix, method='ward')
+        clusters = sch.fcluster(linkage, t=2, criterion='maxclust')
+        self.clustered_rules = [[] for _ in range(max(clusters))]
+        for i, c in enumerate(clusters):
+            self.clustered_rules[c-1].append(self.rules[i])
+        self.clustered_rules = [torch.tensor(cluster).float() for cluster in self.clustered_rules]
+        self.systems = []
+        for i in range(len(self.clustered_rules)):
+            self.systems.append(fuzz.control.ControlSystem(self.clustered_rules[i].tolist()))
+
+    def forward(self, x):
+        # Update SOM
+        for sample in x:
+            winner = np.unravel_index(np.linalg.norm(self.som - sample, axis=2).argmin(), self.som.shape[:2])
+            for i in range(self.input_size):
+                self.som[winner[0], winner[1], i] = sample[i]
+                
+        # Compute Fuzzy System Outputs
+        inputs = []
+        for i in range(self.input_size):
+            inputs.append(self.som[:,:,i].flatten())
+        input_dict = {}
+        for i in range(self.input_size):
+            input_dict['input'+str(i)] = inputs[i]
+        output_dicts = []
+        for i in range(len(self.systems)):
+            output_dicts.append(self.systems[i].simulate(input_dict))
+        outputs = []
+        for i in range(self.output_size):
+            output_cluster = []
+            for output_dict in output_dicts:
+                output_cluster.append(output_dict['output'+str(i)])
+            output_cluster = torch.stack(output_cluster, dim=0)
+            output = output_cluster.mean(dim=0)
+            outputs.append(output)
+        return torch.stack(outputs, dim=1)
+class FractalPerceptron:
+    def __init__(self, num_layers, num_neurons_per_layer, input_shape, output_shape, learning_rate=0.01):
+        self.num_layers = num_layers
+        self.num_neurons_per_layer = num_neurons_per_layer
+        self.input_shape = input_shape
+        self.output_shape = output_shape
+        self.learning_rate = learning_rate
+        self.weights = []
+        self.bias = []
+        
+        # Initialize weights and bias for each layer
+        for i in range(num_layers):
+            if i == 0:
+                self.weights.append(np.random.randn(num_neurons_per_layer[i], input_shape))
+            else:
+                self.weights.append(np.random.randn(num_neurons_per_layer[i], num_neurons_per_layer[i-1]))
+            self.bias.append(np.random.randn(num_neurons_per_layer[i]))
+            
+        # Initialize SOM
+        self.som_weights = np.random.randn(*num_neurons_per_layer, input_shape)
+        
+    def predict(self, x):
+        # Feedforward for the first layer
+        a = self.weights[0] @ x + self.bias[0]
+        z = self.activation_function(a)
+        
+        # Feedforward for the rest of the layers
+        for i in range(1, self.num_layers):
+            a = self.weights[i] @ z + self.bias[i]
+            z = self.activation_function(a)
+        
+        # SOM step
+        som_input = np.repeat(x[np.newaxis, :], self.num_neurons_per_layer, axis=0)
+        diff = self.som_weights - som_input
+        dist = np.linalg.norm(diff, axis=-1)
+        winning_index = np.unravel_index(np.argmin(dist), self.num_neurons_per_layer)
+        neighbor_indices = self.get_neighbors(winning_index)
+        self.som_weights[winning_index] += self.learning_rate * (x - self.som_weights[winning_index])
+        for neighbor_index in neighbor_indices:
+            self.som_weights[neighbor_index] += self.learning_rate * (x - self.som_weights[neighbor_index])
+        
+        return z
+    
+    def train(self, x_train, y_train, num_epochs):
+        for epoch in range(num_epochs):
+            for x, y in zip(x_train, y_train):
+                # Feedforward
+                a = [None] * self.num_layers
+                z = [None] * self.num_layers
+                a[0] = self.weights[0] @ x + self.bias[0]
+                z[0] = self.activation_function(a[0])
+
+                for i in range(1, self.num_layers):
+                    a[i] = self.weights[i] @ z[i-1] + self.bias[i]
+                    z[i] = self.activation_function(a[i])
+
+                # Backpropagation
+                delta = (z[-1] - y) * self.activation_function_derivative(a[-1])
+                for i in range(self.num_layers-2, -1, -1):
+                    delta = (self.weights[i+1].T @ delta) * self.activation_function_derivative(a[i])
+
+                # Update weights and bias for the output layer
+                self.weights[-1] -= self.learning_rate * np.outer(delta, z[-2])
+                self.bias[-1] -= self.learning_rate * delta
+
+                # Update weights and bias for the rest of the layers
+                for i in range(self.num_layers-2, -1, -1):
+                    self.weights[i] -= self.learning_rate * np.outer(delta, z[i-1])
+                    self.bias[i] -= self.learning_rate * delta                                                                                                                          
+    def get_neighbors(self, index):
+        """
+        Returns a list of neighboring indices of a given index in the SOM grid.
+        """
+        neighbors = []
+        for i in range(self.num_neurons_per_layer[0]):
+            for j in range(self.num_neurons_per_layer[1]):
+                if abs(i-index[0]) <= 1 and abs(j-index[1]) <= 1:
+                    neighbors.append((i, j))
+        neighbors.remove(index)
+        return neighbors
+
+    def activation_function(self, x):
+        """
+        Returns the output of the ReLU activation function for a given input x.
+        """
+        return np.maximum(0, x)
+
+    def activation_function_derivative(self, x):
+        """
+        Returns the derivative of the ReLU activation function for a given input x.
+        """
+        return np.where(x > 0, 1, 0)
+
+class FractalAutoML(torch.nn.Module):
+    def __init__(self, input_size, output_size, num_rules, fractal_depth):
+        super(FractalAutoML, self).__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.num_rules = num_rules
+        self.fractal_depth = fractal_depth
+        self.fuzzy_network = FuzzyNetwork(input_size, output_size, num_rules)
+        self.fractal_perceptrons = []
+        for depth in range(1, fractal_depth+1):
+            self.fractal_perceptrons.append(FractalPerceptron(self.fuzzy_network, depth))
+
+    def forward(self, x):
+        out = 0
+        for fractal_perceptron in self.fractal_perceptrons:
+            out += fractal_perceptron(x)
+        return out
+
+    def train(self, train_data, epochs=10):
+        for epoch in range(epochs):
+            # Forward pass
+            outputs = self(train_data)
+            # Compute loss
+            loss = torch.mean((outputs - train_labels)**2)
+            # Backpropagate
+            loss.backward()
+            # Update parameters
+            self.optimizer.step()
+            # Print loss
+            print(loss.item())
+
+    def evaluate(self, test_data):
+        outputs = self(test_data)
+        loss = torch.mean((outputs - test_labels)**2)
+        return loss
+
+    def compress(self):
+        # Get the teacher model
+        teacher = FractalAutoML(self.input_size, self.output_size, self.num_rules, self.fractal_depth - 1)
+        # Train the teacher model
+        teacher.train(train_data, epochs=10)
+        # Distil the teacher model to the student model
+        self.distill(teacher)
+
+    def distill(self, teacher):
+        # Get the teacher's output
+        teacher_outputs = teacher(train_data)
+        # Get the student's output
+        student_outputs = self(train_data)
+        # Compute the distillation loss
+        distillation_loss = torch.mean((teacher_outputs - student_outputs)**2)
+        # Backpropagate the distillation loss
+        distillation_loss.backward()
+        # Update the student's parameters
+        self.optimizer.step()   
+
+class FuzzyMemory:
+    def __init__(self, graph):
+        self.graph = graph
+        self.memories = {}
+
+    def add_memory(self, key, value):
+        self.memories[key] = value
+
+    def get_memory(self, key):
+        if key not in self.memories:
+            return None
+        return self.memories[key]
+
+    def clear_memory(self):
+        self.memories = {}
+
+    def crawl_network(self):
+        for node in self.graph.nodes:
+            for neighbor in self.graph.neighbors(node):
+                self.add_memory(node, neighbor)
+
+    def create_network(self, fractal_automl):
+        # Get the fractal automl's parameters
+        input_size = fractal_automl.input_size
+        output_size = fractal_automl.output_size
+        num_rules = fractal_automl.num_rules
+        fractal_depth = fractal_automl.fractal_depth
+
+        # Create the fuzzy network
+        fuzzy_network = FuzzyNetwork(input_size, output_size, num_rules)
+
+        # Create the fractal perceptrons
+        fractal_perceptrons = []
+        for depth in range(1, fractal_depth+1):
+            fractal_perceptrons.append(FractalPerceptron(fuzzy_network, depth))
+
+        # Create the FractalAutoML object
+        fractal_automl = FractalAutoML(input_size, output_size, num_rules, fractal_depth)
+
+        # Set the FractalAutoML's fuzzy network
+        fractal_automl.fuzzy_network = fuzzy_network
+
+        # Set the FractalAutoML's fractal perceptrons
+        fractal_automl.fractal_perceptrons = fractal_perceptrons
+
+        return fractal_automl
